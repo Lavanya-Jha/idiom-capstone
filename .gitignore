@@ -1,0 +1,44 @@
+# ── Virtual environment ──────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+*.egg-info/
+
+# ── Large data / model files ─────────────────────────────────────────────────
+conceptnet/          # ConceptNet NumberBatch (~900 MB) — download separately
+cache/               # Pre-computed CLIP embedding caches
+models/              # Trained .pt checkpoint files (regenerate with train_phase4.py)
+
+# ── Dataset images (not redistributable) ────────────────────────────────────
+dataset/
+data/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+
+# ── Python artifacts ──────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── OS / editor files ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Logs and temp ────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
