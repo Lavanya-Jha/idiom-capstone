@@ -51,6 +51,7 @@ import clip
 from PIL import Image
 from tqdm import tqdm
 import config_phase1 as cfg
+from idiom_database import get_visual_prompts
 
 
 # ==============================================================================
@@ -71,20 +72,120 @@ CACHE_DIR         = os.path.join(os.path.dirname(__file__), "cache")
 # ==============================================================================
 
 def generate_iapd_prompts(idiom, sentence):
-    words = idiom.lower().split()
-    if len(words) >= 2:
-        literal = f"a photo showing {' and '.join(words[:3])}"
+    """
+    Generate 3 IAPD prompts. Uses specific visual descriptions from IDIOM_DB
+    when available — dramatically improves CLIP matching accuracy over generic
+    prompts like 'an image representing the figurative meaning of X'.
+    """
+    vis_fig, vis_lit = get_visual_prompts(idiom)
+
+    # Literal prompt: use DB-specific visual if available, else word-based fallback
+    if vis_lit:
+        literal = vis_lit
     else:
-        literal = f"a photo of {idiom}"
-    figurative = f"an image representing the figurative meaning of the expression '{idiom}'"
-    contextual  = sentence if sentence and sentence != idiom \
-                  else f"a visual scene depicting '{idiom}'"
+        words = idiom.lower().split()
+        if len(words) >= 2:
+            literal = f"a photo showing {' and '.join(words[:3])}"
+        else:
+            literal = f"a photo of {idiom}"
+
+    # Figurative prompt: use DB-specific visual if available, else generic fallback
+    if vis_fig:
+        figurative = vis_fig
+    else:
+        figurative = f"an image representing the figurative meaning of the expression '{idiom}'"
+
+    # Contextual prompt: actual sentence de-idiomised when possible
+    contextual = sentence if sentence and sentence != idiom \
+                 else f"a visual scene depicting '{idiom}'"
+
     return {"literal": literal, "figurative": figurative, "contextual": contextual}
 
 
 # ==============================================================================
 # DATA LOADING — reads augmented TSV with captions
 # ==============================================================================
+
+def load_original_task_a(tsv_path, images_root):
+    """
+    Fallback loader: reads the ORIGINAL (non-augmented) Task A TSV and adds
+    synthetic captions so cache_phase3 can still build its cache.
+    The caption text falls back inside cache_split_phase3 to
+    "an image related to {idiom}" — perfectly valid for training.
+    """
+    data = []
+    with open(tsv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            idiom    = row["compound"].strip()
+            sentence = row.get("sentence", idiom).strip() or idiom
+            try:
+                expected_order = ast.literal_eval(row["expected_order"])
+                correct_image  = expected_order[0]
+            except Exception:
+                continue
+            images = []
+            for i in range(1, 6):
+                key = f"image{i}_name"
+                if key in row and row[key].strip():
+                    images.append(row[key].strip())
+            if not images:
+                continue
+            try:
+                label = images.index(correct_image)
+            except ValueError:
+                continue
+            for idiom_folder in [idiom, idiom.replace("'", "_"), idiom.replace("'", "")]:
+                if os.path.exists(os.path.join(images_root, idiom_folder, images[0])):
+                    break
+            full_paths = [os.path.join(images_root, idiom_folder, img) for img in images]
+            data.append({
+                "idiom":    idiom,
+                "sentence": sentence,
+                "images":   full_paths,
+                "captions": [""] * len(images),  # synthetic fallback captions
+                "label":    label
+            })
+    return data
+
+
+def load_original_task_b(tsv_path, images_root):
+    """Fallback loader for Task B original TSV with synthetic captions."""
+    seen = set()
+    data = []
+    with open(tsv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            idiom = row["compound"].strip()
+            if idiom in seen:
+                continue
+            seen.add(idiom)
+            correct_image = row.get("expected_item", "").strip()
+            sentence      = row.get("sequence_caption1", idiom).strip() or idiom
+            images = []
+            for i in range(1, 8):
+                key = f"image{i}_name"
+                if key in row and row[key].strip():
+                    images.append(row[key].strip())
+            if not images:
+                continue
+            try:
+                label = images.index(correct_image)
+            except ValueError:
+                continue
+            for idiom_folder in [idiom, idiom.replace("'", "_"), idiom.replace("'", "")]:
+                if os.path.exists(os.path.join(images_root, idiom_folder, images[0])):
+                    break
+            full_paths = [os.path.join(images_root, idiom_folder, img) for img in images]
+            data.append({
+                "idiom":    idiom,
+                "sentence": sentence,
+                "images":   full_paths,
+                "captions": [""] * len(images),
+                "label":    label
+            })
+    return data
+
 
 def load_augmented_task_a(tsv_path, images_root):
     """
@@ -420,8 +521,39 @@ def main():
         torch.save(train_cache, p3_a_train)
         torch.save(val_cache,   p3_a_val)
         print(f"\n  ✓ Phase 3 Task A cached: {p3_a_train}")
+    elif os.path.exists(cfg.TASK_A_TRAIN):
+        # ── Fallback: use original TSV with synthetic captions ─────────────────
+        print(f"\n  ⚠ Augmented TSV not found — falling back to original TSV with synthetic captions.")
+        print("  (Captions will be auto-generated as 'an image related to <idiom>')")
+        print("\nProcessing Task A (original TSV fallback)...")
+        train_data = load_original_task_a(cfg.TASK_A_TRAIN, cfg.TASK_A_TRAIN_IMG)
+        val_data   = load_original_task_a(cfg.TASK_A_VAL,   cfg.TASK_A_VAL_IMG)
+
+        # Merge Extended if available
+        EXTENDED_TSV = os.path.join(cfg.DATA_ROOT, "Subtask A", "EN", "Extended", "xeval", "subtask_a_xe.tsv")
+        EXTENDED_IMG = os.path.join(cfg.DATA_ROOT, "Subtask A", "EN", "Extended", "xeval")
+        if os.path.exists(EXTENDED_TSV):
+            seen_idioms = {item["idiom"] for item in train_data}
+            extra = load_original_task_a(EXTENDED_TSV, EXTENDED_IMG)
+            added = 0
+            for item in extra:
+                if item["idiom"] not in seen_idioms:
+                    train_data.append(item)
+                    seen_idioms.add(item["idiom"])
+                    added += 1
+            print(f"  Extended: added {added} new idioms → total train = {len(train_data)}")
+
+        print(f"  Task A Train: {len(train_data)} unique idioms")
+        print(f"  Task A Val:   {len(val_data)} unique idioms")
+
+        train_cache = cache_split_phase3(train_data, "Task A Train", clip_model, preprocess, cn_embeddings, device)
+        val_cache   = cache_split_phase3(val_data,   "Task A Val",   clip_model, preprocess, cn_embeddings, device)
+
+        torch.save(train_cache, p3_a_train)
+        torch.save(val_cache,   p3_a_val)
+        print(f"\n  ✓ Phase 3 Task A cached: {p3_a_train}")
     else:
-        print(f"\n  ⚠ Augmented Task A TSV not found at {AUGMENTED_A_TRAIN}")
+        print(f"\n  ⚠ No Task A data found (tried augmented and original TSV paths). Skipping.")
 
     # ── Task B ────────────────────────────────────────────────────────────────
     p3_b_train = os.path.join(CACHE_DIR, "phase3_task_b_train.pt")
@@ -433,6 +565,21 @@ def main():
         print("\nProcessing Task B...")
         train_b = load_augmented_task_b(AUGMENTED_B_TRAIN, cfg.TASK_B_TRAIN_IMG)
         val_b   = load_augmented_task_b(AUGMENTED_B_VAL,   cfg.TASK_B_VAL_IMG)
+
+        print(f"  Task B Train: {len(train_b)} unique idioms")
+        print(f"  Task B Val:   {len(val_b)} unique idioms")
+
+        train_b_cache = cache_split_phase3(train_b, "Task B Train", clip_model, preprocess, cn_embeddings, device)
+        val_b_cache   = cache_split_phase3(val_b,   "Task B Val",   clip_model, preprocess, cn_embeddings, device)
+
+        torch.save(train_b_cache, p3_b_train)
+        torch.save(val_b_cache,   p3_b_val)
+        print(f"\n  ✓ Phase 3 Task B cached: {p3_b_train}")
+    elif os.path.exists(cfg.TASK_B_TRAIN):
+        print(f"\n  ⚠ Augmented Task B TSV not found — falling back to original TSV.")
+        print("\nProcessing Task B (original TSV fallback)...")
+        train_b = load_original_task_b(cfg.TASK_B_TRAIN, cfg.TASK_B_TRAIN_IMG)
+        val_b   = load_original_task_b(cfg.TASK_B_VAL,   cfg.TASK_B_VAL_IMG)
 
         print(f"  Task B Train: {len(train_b)} unique idioms")
         print(f"  Task B Val:   {len(val_b)} unique idioms")

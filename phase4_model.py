@@ -102,21 +102,28 @@ def extract_signals(cache, device="cpu"):
 
 class MLPHead(nn.Module):
     """
-    Small MLP scorer adapted from the Subtask B IdiomModel's MLP head.
+    Upgraded MLP scorer: two hidden layers (8→64→32→1) with residual shortcut.
 
-    Subtask B used:  Linear(1025→512) → LN → GELU → Dropout → Linear(512→256) → LN → GELU → Dropout → Linear(256→1)
-    Our version:     Linear(8→16)     → LN → GELU → Dropout → Linear(16→1)
-                     + shortcut Linear(8→1)   (residual connection)
+    Architecture:
+        Linear(8→64) → LayerNorm → GELU → Dropout(0.2)
+        Linear(64→32) → LayerNorm → GELU → Dropout(0.1)
+        Linear(32→1)
+        + residual shortcut: Linear(8→1) added to output
 
-    Total trainable: 8*16+16 + 16+16 + 16*1+1 + 8*1+1 = 170 params
+    Total trainable: 8*64+64 + 64+64 + 64*32+32 + 32+32 + 32*1+1 + 8*1 ≈ 2,849 params
+    Still tiny relative to the 100-sample dataset, but deeper = more expressive.
     """
-    def __init__(self, n_signals=8, hidden=16, dropout=0.1):
+    def __init__(self, n_signals=8, hidden=64, dropout=0.2):
         super().__init__()
+        hidden2 = hidden // 2  # 32
         self.fc1      = nn.Linear(n_signals, hidden)
         self.ln1      = nn.LayerNorm(hidden)
-        self.drop     = nn.Dropout(dropout)
-        self.fc2      = nn.Linear(hidden, 1)
-        self.shortcut = nn.Linear(n_signals, 1, bias=False)  # residual
+        self.drop1    = nn.Dropout(dropout)
+        self.fc2      = nn.Linear(hidden, hidden2)
+        self.ln2      = nn.LayerNorm(hidden2)
+        self.drop2    = nn.Dropout(dropout / 2)
+        self.fc3      = nn.Linear(hidden2, 1)
+        self.shortcut = nn.Linear(n_signals, 1, bias=False)
 
         # Init shortcut to equal weights (prior: all signals equally useful)
         nn.init.constant_(self.shortcut.weight, 1.0 / n_signals)
@@ -129,8 +136,10 @@ class MLPHead(nn.Module):
             score: (..., 1)
         """
         out = F.gelu(self.ln1(self.fc1(x)))
-        out = self.drop(out)
-        out = self.fc2(out)
+        out = self.drop1(out)
+        out = F.gelu(self.ln2(self.fc2(out)))
+        out = self.drop2(out)
+        out = self.fc3(out)
         out = out + self.shortcut(x)   # residual
         return out
 

@@ -33,7 +33,7 @@ import os
 # and the data lives in Capstone/
 # ==============================================================================
 
-DATA_ROOT = os.path.join(os.path.dirname(__file__), "..")
+DATA_ROOT = r"C:\Users\Komal\Desktop\Capstone Project"
 
 # ==============================================================================
 # TASK A PATHS
