@@ -19,6 +19,7 @@ import os, io, pickle, re
 import numpy as np
 import torch
 import torch.nn.functional as F
+import requests
 import clip
 from PIL import Image
 import streamlit as st
@@ -499,17 +500,232 @@ IDIOM_DB = {
                              "a recently fired gun proves someone just shot it — irrefutable evidence"),
 }
 
+def _word_inflections(word):
+    """
+    Return common surface forms of an English word so idiom matching
+    works across tenses/number (e.g. 'kick' also matches 'kicked', 'kicking').
+    """
+    forms = {word}                      # base form
+    forms.add(word + "s")               # 3rd-person singular / plural noun
+
+    if word.endswith("e"):
+        forms.add(word + "d")           # e.g. die  → died
+        forms.add(word + "s")           # e.g. bite → bites
+        forms.add(word[:-1] + "ing")    # e.g. bite → biting
+    elif word.endswith("y") and len(word) > 1 and word[-2] not in "aeiou":
+        forms.add(word[:-1] + "ied")    # e.g. carry → carried
+        forms.add(word[:-1] + "ies")    # e.g. carry → carries
+        forms.add(word + "ing")
+    else:
+        forms.add(word + "ed")          # e.g. kick  → kicked
+        forms.add(word + "ing")         # e.g. kick  → kicking
+        # CVC doubling: run→running, sit→sitting
+        if (len(word) >= 3
+                and word[-1] not in "aeiouywh"
+                and word[-2] in "aeiou"
+                and word[-3] not in "aeiou"):
+            forms.add(word + word[-1] + "ed")
+            forms.add(word + word[-1] + "ing")
+
+    return forms
+
+
 def lookup_idiom(sentence):
+    """
+    Find the longest idiom from IDIOM_DB that appears in the sentence.
+    Handles verb inflections on the FIRST word of the idiom so that e.g.
+    'kicked the bucket' correctly matches the idiom 'kick the bucket'.
+    """
     s = sentence.lower()
     best, best_len = None, 0
+
     for idiom in IDIOM_DB:
-        if idiom in s and len(idiom) > best_len:
-            best, best_len = idiom, len(idiom)
+        # ── 1. Exact match (fastest, handles noun-phrase idioms) ──────────
+        if idiom in s:
+            if len(idiom) > best_len:
+                best, best_len = idiom, len(idiom)
+            continue
+
+        # ── 2. Inflection-aware match on the FIRST word ───────────────────
+        words = idiom.split()
+        if len(words) >= 2:
+            rest = " ".join(words[1:])          # everything after first word
+            for form in _word_inflections(words[0]):
+                candidate = form + " " + rest
+                if candidate in s and len(idiom) > best_len:
+                    best, best_len = idiom, len(idiom)
+                    break
+
     if best:
         entry = IDIOM_DB[best]
         meaning, vis_fig, vis_lit, origin = entry
         return best, meaning, origin, vis_fig, vis_lit
     return None, None, None, None, None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SENTENCE TYPE DETECTION  (LITERAL vs IDIOMATIC)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extract_candidate_ngrams(sentence, min_n=2, max_n=4):
+    """
+    Extract 2-4 word n-grams from the sentence that could be idioms.
+    Filters out n-grams made entirely of stopwords or numbers.
+    Returns list of candidate phrases, longest first.
+    """
+    words = [w.lower().strip(".,!?\"';:-") for w in sentence.split()]
+    words = [w for w in words if w]  # drop empties
+    candidates = []
+    for n in range(max_n, min_n - 1, -1):
+        for i in range(len(words) - n + 1):
+            gram = words[i : i + n]
+            content = [w for w in gram if w not in STOPWORDS and not w.isdigit()]
+            if len(content) >= 1:
+                candidates.append(" ".join(gram))
+    return candidates
+
+
+def fetch_idiom_meaning_api(phrase, openai_key=None):
+    """
+    Try to fetch the meaning of an idiom phrase from external sources.
+
+    Priority:
+      1. Free Dictionary API  (no key, instant)
+      2. OpenAI GPT-3.5       (if api_key provided in sidebar)
+
+    Returns:
+        (meaning: str | None, source: str)
+    """
+    # ── 1. Free Dictionary API ────────────────────────────────────────────────
+    # Works well for single words and some hyphenated/compound entries.
+    phrase_clean = phrase.strip()
+    url_phrase   = phrase_clean.replace(" ", "%20")
+    try:
+        resp = requests.get(
+            f"https://api.dictionaryapi.dev/api/v2/entries/en/{url_phrase}",
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data:
+                for entry in data:
+                    for m in entry.get("meanings", []):
+                        for d in m.get("definitions", []):
+                            defn = d.get("definition", "").strip()
+                            if defn:
+                                return defn, "Free Dictionary API"
+    except Exception:
+        pass
+
+    # ── 2. OpenAI GPT-3.5 (optional — only if key supplied) ───────────────────
+    if openai_key:
+        try:
+            headers = {
+                "Authorization": f"Bearer {openai_key}",
+                "Content-Type":  "application/json",
+            }
+            payload = {
+                "model": "gpt-3.5-turbo",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an expert linguist. "
+                            "Explain the meaning of the given idiom or phrase in one sentence. "
+                            "Be concise and direct."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f'What does the idiom or phrase "{phrase_clean}" mean?',
+                    },
+                ],
+                "max_tokens": 80,
+                "temperature": 0.2,
+            }
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=10,
+            )
+            if r.status_code == 200:
+                answer = (
+                    r.json()
+                    .get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                )
+                if answer:
+                    return answer, "OpenAI GPT-3.5"
+        except Exception:
+            pass
+
+    return None, "not found"
+
+
+def detect_idiom_with_api(sentence, openai_key=None):
+    """
+    For sentences where no idiom was found in IDIOM_DB, try to:
+      1. Extract all 2–4 word n-grams
+      2. Score each n-gram for "idiom-likeness" using CLIP
+         (figurative probe similarity vs literal probe similarity)
+      3. For the top candidate, call fetch_idiom_meaning_api()
+
+    Returns:
+        (phrase: str | None, meaning: str | None, source: str, confidence: float)
+    """
+    candidates = extract_candidate_ngrams(sentence)
+    if not candidates:
+        return None, None, "none", 0.0
+
+    # CLIP-based figurativeness score for each candidate n-gram
+    fig_probe = encode_text("This is a figurative idiomatic expression with a non-literal meaning.")
+    lit_probe = encode_text("This is a plain literal factual phrase meaning exactly what it says.")
+
+    best_phrase = None
+    best_score  = -999.0
+
+    for phrase in candidates:
+        p_emb = encode_text(phrase)
+        f_sim = float((p_emb * fig_probe).sum())
+        l_sim = float((p_emb * lit_probe).sum())
+        score = f_sim - l_sim      # positive → looks figurative
+        if score > best_score:
+            best_score  = score
+            best_phrase = phrase
+
+    # Only call API if the top candidate looks meaningfully figurative
+    if best_phrase and best_score > 0.005:
+        meaning, source = fetch_idiom_meaning_api(best_phrase, openai_key)
+        return best_phrase, meaning, source, float(best_score)
+
+    return None, None, "none", 0.0
+
+
+def classify_sentence_type(sentence, idiom_from_db, is_fig_clip, conf_clip):
+    """
+    Determine sentence type with a clear rule hierarchy:
+
+      1. Idiom found in IDIOM_DB           → IDIOMATIC  (certain, source=db)
+      2. CLIP says figurative with conf>40% → IDIOMATIC  (probable, source=clip)
+      3. Otherwise                          → LITERAL
+
+    Returns:
+        (sentence_type: "IDIOMATIC"|"LITERAL", confidence: float, reason: str)
+    """
+    if idiom_from_db:
+        return "IDIOMATIC", 1.0, f'Matched "{idiom_from_db}" in idiom dictionary (inflection-aware)'
+
+    if is_fig_clip and conf_clip >= 0.25:
+        return "IDIOMATIC", conf_clip, "CLIP figurative probe score exceeds literal score"
+
+    if is_fig_clip:
+        # Weak CLIP signal — report as idiomatic but with low confidence
+        return "IDIOMATIC", max(conf_clip, 0.15), "CLIP weakly suggests figurative language"
+
+    return "LITERAL", 1.0 - conf_clip, "No idiom detected; sentence reads as literal"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OBJECT DETECTION: CLIP-based zero-shot (fast, no extra model download)
@@ -858,12 +1074,7 @@ def build_object_chain_reasoning(objects, scenes, idiom, idiom_meaning, idiom_or
     primary_scene   = scene_labels[0][0] if scene_labels else None
 
     if idiom and idiom_meaning:
-        # Step 1: State the identified idiom and its meaning
-        chain_steps.append(
-            f"**Identified idiom:** \"{idiom}\" — meaning: \"{idiom_meaning}\""
-        )
-
-        # Step 2: State what we see in the image
+        # Step 1: State what we see in the image
         if visual_evidence:
             chain_steps.append(
                 f"**Visual elements detected:** {', '.join(visual_evidence)}"
@@ -873,7 +1084,7 @@ def build_object_chain_reasoning(objects, scenes, idiom, idiom_meaning, idiom_or
                 f"**Scene detected:** {primary_scene}"
             )
 
-        # Step 3: ConceptNet associations linking objects → idiom meaning words
+        # Step 2: ConceptNet associations linking objects → idiom meaning words
         if visual_evidence:
             obj_assocs = cn_word_associations(visual_evidence[:3])
             meaning_words = [w.strip(".,;") for w in idiom_meaning.lower().split()
@@ -891,29 +1102,11 @@ def build_object_chain_reasoning(objects, scenes, idiom, idiom_meaning, idiom_or
                         f"**{obj.capitalize()}** → associated with: {', '.join(neighbours[:4])}"
                     )
 
-        # Step 4: Scene → meaning bridge
+        # Step 3: Scene → meaning bridge
         if primary_scene:
             chain_steps.append(
                 f"**Scene → meaning:** \"{primary_scene}\" "
                 f"→ this visually represents someone who is \"{idiom_meaning}\""
-            )
-
-        # Step 5: Final reasoning chain — idiom-grounded narrative
-        # Build the chain: visual elements → scene concept → idiom meaning
-        chain_parts = []
-        if visual_evidence:
-            chain_parts.extend(visual_evidence[:2])
-        if primary_scene:
-            # Condense scene to a short concept
-            scene_concept = primary_scene.replace("a person ", "").replace("someone ", "").strip()
-            scene_concept = scene_concept[:50] + "…" if len(scene_concept) > 50 else scene_concept
-            chain_parts.append(scene_concept)
-        chain_parts.append(idiom_meaning)
-        chain_parts.append(f'"{idiom}"')
-
-        if chain_parts:
-            chain_steps.append(
-                f"**Reasoning chain:** " + " → ".join(chain_parts)
             )
 
     else:
@@ -925,12 +1118,6 @@ def build_object_chain_reasoning(objects, scenes, idiom, idiom_meaning, idiom_or
                 chain_steps.append(f"**{obj.capitalize()}** is associated with: {', '.join(neighbours[:4])}")
         if primary_scene:
             chain_steps.append(f"**Scene interpretation:** {primary_scene}")
-        if visual_evidence or primary_scene:
-            evidence = " → ".join(visual_evidence[:2]) if visual_evidence else primary_scene
-            chain_steps.append(
-                f"**Reasoning chain:** {evidence} → these elements suggest "
-                f"the figurative meaning of the sentence."
-            )
 
     reasoning["object_chain"] = chain_steps
 
@@ -1073,13 +1260,16 @@ CATEGORY_COLORS = {
 # ──────────────────────────────────────────────────────────────────────────────
 # ANALYSIS PIPELINE
 # ──────────────────────────────────────────────────────────────────────────────
-def run_analysis(sentence, images):
+def run_analysis(sentence, images, openai_key=None):
     """Main analysis pipeline. Takes sentence + list of 5 PIL images."""
 
-    # Idiom lookup
+    # ── Step 1: Idiom lookup in IDIOM_DB ─────────────────────────────────────
     idiom, idiom_meaning, idiom_origin, vis_fig, vis_lit = lookup_idiom(sentence)
+    idiom_source = "IDIOM_DB" if idiom else None
+    unknown_idiom_phrase   = None
+    unknown_idiom_api_src  = None
 
-    # Figurative detection
+    # ── Step 2: CLIP figurative vs literal probe scoring ─────────────────────
     fig_probes = [
         "This sentence uses figurative, idiomatic or metaphorical language.",
         "This is an idiomatic expression with a non-literal meaning.",
@@ -1088,14 +1278,39 @@ def run_analysis(sentence, images):
     lit_probes = [
         "This sentence is literal and straightforward with no idioms.",
         "This sentence means exactly what it says with no figurative language.",
-        "This is a plain factual statement with no metaphors.",
+        "This is a plain factual statement with no metaphors or idioms.",
     ]
     s_emb = encode_text(sentence)
     fs = float(sum((s_emb * encode_text(p)).sum().item() for p in fig_probes) / len(fig_probes))
     ls = float(sum((s_emb * encode_text(p)).sum().item() for p in lit_probes) / len(lit_probes))
     is_fig = fs > ls
-    diff = fs - ls
-    conf = float(min(abs(diff) * 20, 1.0))
+    diff   = fs - ls
+    conf   = float(min(abs(diff) * 20, 1.0))
+
+    # ── Step 3: Sentence type classification ─────────────────────────────────
+    sentence_type, type_conf, type_reason = classify_sentence_type(
+        sentence, idiom, is_fig, conf
+    )
+
+    # ── Step 4: If no idiom in DB but sentence looks idiomatic → try API ─────
+    if not idiom and sentence_type == "IDIOMATIC":
+        unk_phrase, unk_meaning, unk_src, unk_conf = detect_idiom_with_api(
+            sentence, openai_key=openai_key
+        )
+        if unk_phrase and unk_meaning:
+            unknown_idiom_phrase  = unk_phrase
+            idiom_meaning         = unk_meaning
+            idiom_origin          = "Source: " + unk_src
+            idiom                 = unk_phrase
+            idiom_source          = unk_src
+            unknown_idiom_api_src = unk_src
+            # Generate synthetic vis prompts since we have no DB entry
+            vis_fig = f"an image representing the figurative or abstract meaning of '{unk_phrase}'"
+            vis_lit = f"a literal physical depiction of the words '{unk_phrase}'"
+        elif unk_phrase:
+            # Phrase detected but API returned no meaning
+            unknown_idiom_phrase  = unk_phrase
+            idiom_source          = "detected (no meaning found)"
 
     # IAPD perspectives
     perspectives = iapd_prompts(sentence, idiom, vis_fig, vis_lit, idiom_meaning)
@@ -1194,15 +1409,21 @@ def run_analysis(sentence, images):
     )
 
     return {
-        "is_figurative": is_fig,
-        "confidence": conf,
-        "idiom": idiom,
-        "idiom_meaning": idiom_meaning,
-        "idiom_origin": idiom_origin,
-        "perspectives": perspectives,
-        "results": results,
-        "reasoning": reasoning,
-        "scoring_method": scoring_method,
+        "is_figurative":        is_fig,
+        "confidence":           conf,
+        "sentence_type":        sentence_type,       # "IDIOMATIC" or "LITERAL"
+        "type_confidence":      type_conf,
+        "type_reason":          type_reason,
+        "idiom":                idiom,
+        "idiom_meaning":        idiom_meaning,
+        "idiom_origin":         idiom_origin,
+        "idiom_source":         idiom_source,        # "IDIOM_DB" / API name / None
+        "unknown_idiom_phrase": unknown_idiom_phrase,
+        "unknown_idiom_api_src":unknown_idiom_api_src,
+        "perspectives":         perspectives,
+        "results":              results,
+        "reasoning":            reasoning,
+        "scoring_method":       scoring_method,
     }
 
 
@@ -1215,12 +1436,28 @@ def run_analysis(sentence, images):
 st.title("Figurative Language Understanding")
 st.caption("Visual Grounding and Commonsense Reasoning for Multimodal Figurative Language")
 
-# Model status
-cn_status   = "✅ loaded" if CN is not None else "❌ not found"
-p4a_status  = "✅ loaded (73.3% val)" if PHASE4_MODEL  is not None else "⬜ not found — using FLGS zero-shot"
-p4b_status  = "✅ loaded (80.0% val)" if PHASE4_MODEL_B is not None else "⬜ not found"
-with st.expander("Model Status"):
-    st.write(f"**CLIP ViT-B/32:** ✅ loaded")
+# ── Sidebar — model status + optional OpenAI key ────────────────────────────
+with st.sidebar:
+    st.header("Settings")
+
+    st.subheader(" OpenAI API Key (optional)")
+    st.caption(
+        "Used only for unknown idioms not in the built-in dictionary. "
+        "Leave blank to use the free fallback (Free Dictionary API)."
+    )
+    openai_api_key = st.text_input(
+        "OpenAI API key",
+        type="password",
+        placeholder="sk-...",
+        help="If provided, GPT-3.5-turbo is queried when an idiom is not found in the built-in dictionary.",
+    )
+
+    st.divider()
+    st.subheader(" Model Status")
+    cn_status  = " loaded" if CN is not None else "not found"
+    p4a_status = " loaded" if PHASE4_MODEL   is not None else "not found (FLGS fallback)"
+    p4b_status = " loaded" if PHASE4_MODEL_B is not None else "not found"
+    st.write(f"**CLIP ViT-B/32:**  loaded")
     st.write(f"**ConceptNet:** {cn_status}")
     st.write(f"**Phase 4 Task A:** {p4a_status}")
     st.write(f"**Phase 4 Task B:** {p4b_status}")
@@ -1231,7 +1468,7 @@ st.divider()
 st.subheader("Input")
 
 sentence = st.text_input(
-    "Sentence (must contain an idiom):",
+    "Enter a sentence (idiomatic or literal):",
     value="Comparing the two job offers is like comparing apples and oranges; they have different salary structures and benefits.",
 )
 
@@ -1247,7 +1484,6 @@ if uploaded_files:
         st.warning(f"Please select exactly 5 images. You selected {len(uploaded_files)}.")
     else:
         pil_images = [Image.open(f).convert("RGB") for f in uploaded_files]
-        # Show thumbnails in a row
         cols = st.columns(5)
         for i, (col, img, f) in enumerate(zip(cols, pil_images, uploaded_files)):
             col.image(img, caption=f.name, use_container_width=True)
@@ -1261,7 +1497,11 @@ if not ready and uploaded_files:
 
 if st.button("Analyse", type="primary", disabled=not ready):
     with st.spinner("Running analysis — CLIP encoding, IAPD prompts, scoring, object detection..."):
-        data = run_analysis(sentence.strip(), pil_images)
+        data = run_analysis(
+            sentence.strip(),
+            pil_images,
+            openai_key=openai_api_key.strip() or None,
+        )
 
     st.divider()
 
@@ -1270,23 +1510,75 @@ if st.button("Analyse", type="primary", disabled=not ready):
     # ══════════════════════════════════════════════════════════════════════
     st.subheader("1. Sentence Analysis")
 
-    if data["is_figurative"]:
-        st.success(f"Figurative / Idiomatic language detected — Confidence: {data['confidence']*100:.1f}%")
-    else:
-        st.warning(f"Likely literal language — Confidence: {data['confidence']*100:.1f}%")
+    # ── Big LITERAL / IDIOMATIC badge ────────────────────────────────────
+    stype      = data.get("sentence_type", "LITERAL")
+    tconf      = data.get("type_confidence", 0.0)
+    treason    = data.get("type_reason", "")
 
-    if data["idiom"]:
-        st.write(f"**Idiom detected:** \"{data['idiom']}\"")
-        st.write(f"**Meaning:** {data['idiom_meaning']}")
-        st.write(f"**Origin:** {data['idiom_origin']}")
+    if stype == "IDIOMATIC":
+        st.success(
+            f" **IDIOMATIC** sentence detected  —  "
+            f"Confidence: {tconf*100:.0f}%"
+        )
     else:
-        st.write("No known idiom matched — analysing as general figurative expression.")
+        st.info(
+            f" **LITERAL** sentence  —  "
+            f"Confidence: {tconf*100:.0f}%"
+        )
+
+    st.caption(f"*Classification reason: {treason}*")
+
+    st.write("")  # spacer
+
+    # ── Idiom details ─────────────────────────────────────────────────────
+    if data["idiom"]:
+        src = data.get("idiom_source", "")
+        src_badge = {
+            "IDIOM_DB":           " Built-in dictionary",
+            "Free Dictionary API":" Free Dictionary API",
+            "OpenAI GPT-3.5":     " OpenAI GPT-3.5",
+        }.get(src, f" {src}" if src else "")
+
+        st.write(f"**Idiom detected:** \"{data['idiom']}\"")
+
+        c1, c2 = st.columns([3, 1])
+        c1.write(f"**Meaning:** {data['idiom_meaning']}")
+        if src_badge:
+            c2.write(f"**Source:** {src_badge}")
+
+        if data.get("idiom_origin"):
+            st.write(f"**Origin / Notes:** {data['idiom_origin']}")
+
+        # Highlight the idiom phrase inside the sentence
+        _highlighted = sentence.replace(
+            data["idiom"],
+            f"**{data['idiom']}**",
+        )
+        st.markdown(f"**Sentence:** {_highlighted}")
+
+    elif stype == "IDIOMATIC":
+        # Sentence flagged as idiomatic but no specific phrase found
+        unk = data.get("unknown_idiom_phrase")
+        if unk:
+            st.warning(
+                f" Possible idiom detected: **\"{unk}\"** — "
+                f"but meaning could not be retrieved from the API. "
+                f"Try adding an OpenAI API key in the sidebar for best results."
+            )
+        else:
+            st.warning(
+                " Sentence appears figurative/idiomatic but no specific idiom phrase "
+                "was identified."
+            )
+    else:
+        st.write(" No idiom detected. This sentence is treated as a plain literal statement.")
+
+    st.write("")
 
     st.write("**IAPD Prompts used for scoring:**")
-    pcols = st.columns(3)
+    pcols = st.columns(2)
     pcols[0].info(f"**Literal prompt:**\n\n{data['perspectives'][0]}")
     pcols[1].success(f"**Figurative prompt:**\n\n{data['perspectives'][1]}")
-    pcols[2].warning(f"**Contextual prompt:**\n\n{data['perspectives'][2]}")
 
     st.divider()
 
@@ -1336,7 +1628,7 @@ if st.button("Analyse", type="primary", disabled=not ready):
     reasoning = data["reasoning"]
 
     # 1. Visual Evidence
-    st.write("#### 👁️ Visual Evidence")
+    st.write("####  Visual Evidence")
     ve = reasoning["visual_evidence"]
     if ve["objects"]:
         st.write("**Objects detected in top-ranked image:**")
@@ -1352,13 +1644,13 @@ if st.button("Analyse", type="primary", disabled=not ready):
     st.write("---")
 
     # 2. Scene Description
-    st.write("#### 📷 Scene Description")
-    st.write(reasoning["scene_description"])
+    #st.write("####  Scene Description")
+    #st.write(reasoning["scene_description"])
 
-    st.write("---")
+    #st.write("---")
 
     # 3. Object Chain → Commonsense Reasoning
-    st.write("#### 🧠 Object Chain → Commonsense Reasoning")
+    st.write("####  Object Chain → Commonsense Reasoning")
     if reasoning["object_chain"]:
         for step in reasoning["object_chain"]:
             # strip markdown bold for plain display
@@ -1370,8 +1662,8 @@ if st.button("Analyse", type="primary", disabled=not ready):
     st.write("---")
 
     # 3.5  ConceptNet Knowledge Graph
-    st.write("#### 🔗 ConceptNet Knowledge Graph")
-    st.write("Semantic relations from idiom words to abstract concepts (via NumberBatch embeddings).")
+    st.write("####  ConceptNet Knowledge Graph")
+    st.write("Semantic relations from idiom words to abstract concepts")
 
     _cn_idiom = data.get("idiom") or ""
     _cn_meaning = data.get("idiom_meaning") or ""
@@ -1380,9 +1672,6 @@ if st.button("Analyse", type="primary", disabled=not ready):
         _chains = build_cn_relation_chains(_cn_idiom, top_n=5)
 
         if _chains:
-            st.write(f"**Idiom:** \"{_cn_idiom}\"")
-            st.write("")
-
             # Per-word relation chains
             for _word, _relations in _chains.items():
                 # Group concepts by relation type for a cleaner display
@@ -1397,13 +1686,6 @@ if st.button("Analyse", type="primary", disabled=not ready):
 
                 _chain_str = f"**{_word}** → " + "  |  ".join(_chain_parts)
                 st.markdown(_chain_str)
-
-            st.write("")
-
-            # Assembled interpretation sentence
-            _assembled = build_cn_assembled_sentence(_cn_idiom, _chains, _cn_meaning)
-            if _assembled:
-                st.info(f"**Assembled interpretation:** {_assembled}")
         else:
             st.write(
                 f"No NumberBatch entries found for the content words of \"{_cn_idiom}\". "
@@ -1417,7 +1699,7 @@ if st.button("Analyse", type="primary", disabled=not ready):
     st.write("---")
 
     # 4. Idiom Match
-    st.write("#### 💡 Idiom Match")
+    st.write("####  Idiom Match")
     im = reasoning["idiom_match"]
     if im["idiom"]:
         st.write(f"**Matched idiom:** \"{im['idiom']}\"")
@@ -1432,7 +1714,7 @@ if st.button("Analyse", type="primary", disabled=not ready):
     st.write("---")
 
     # 5. Score Breakdown
-    st.write("#### ✅ Score Breakdown (Top-Ranked Image)")
+    st.write("####  Score Breakdown (Top-Ranked Image)")
     sb = reasoning["score_breakdown"]
     st.write(f"**Category:** {sb['category']}")
     sc1, sc2, sc3, sc4 = st.columns(4)
@@ -1447,6 +1729,6 @@ if st.button("Analyse", type="primary", disabled=not ready):
     st.write("---")
 
     # 6. Final Conclusion
-    st.write("#### 🎯 Final Figurative Meaning")
+    st.write("####  Final Figurative Meaning")
     clean_conclusion = reasoning["conclusion"].replace("**", "")
     st.write(clean_conclusion)
