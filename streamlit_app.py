@@ -697,7 +697,7 @@ def detect_idiom_with_api(sentence, openai_key=None):
             best_phrase = phrase
 
     # Only call API if the top candidate looks meaningfully figurative
-    if best_phrase and best_score > 0.005:
+    if best_phrase and best_score > 0.02:
         meaning, source = fetch_idiom_meaning_api(best_phrase, openai_key)
         return best_phrase, meaning, source, float(best_score)
 
@@ -718,13 +718,12 @@ def classify_sentence_type(sentence, idiom_from_db, is_fig_clip, conf_clip):
     if idiom_from_db:
         return "IDIOMATIC", 1.0, f'Matched "{idiom_from_db}" in idiom dictionary (inflection-aware)'
 
-    if is_fig_clip and conf_clip >= 0.25:
+    if is_fig_clip and conf_clip >= 0.40:
         return "IDIOMATIC", conf_clip, "CLIP figurative probe score exceeds literal score"
 
-    if is_fig_clip:
-        # Weak CLIP signal — report as idiomatic but with low confidence
-        return "IDIOMATIC", max(conf_clip, 0.15), "CLIP weakly suggests figurative language"
-
+    # Below 40% confidence with no DB match → treat as LITERAL.
+    # A weak CLIP signal is not enough to call a sentence idiomatic —
+    # plain sentences often score marginally higher on figurative probes by chance.
     return "LITERAL", 1.0 - conf_clip, "No idiom detected; sentence reads as literal"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1177,69 +1176,99 @@ def build_object_chain_reasoning(objects, scenes, idiom, idiom_meaning, idiom_or
 # ──────────────────────────────────────────────────────────────────────────────
 # AUTO-CATEGORISATION
 # ──────────────────────────────────────────────────────────────────────────────
-def auto_categorise(results):
+def auto_categorise(results, sentence_type="IDIOMATIC"):
     """
-    Categorise each image as Figurative / Literal / Partial Literal / Random.
+    Enforce a strict 1-1-2-1 category distribution across exactly 5 images:
+        1 × Figurative
+        1 × Literal
+        2 × Partial Literal
+        1 × Random
 
-    Logic:
-      1. Figurative  — highest FLGS score AND positive gap (fig > lit)
-      2. Literal     — highest lit_score AND negative gap (lit > fig)
-      3. Partial Literal — among remaining, those whose lit_score is ABOVE
-                          the mean lit_score of all images (genuinely related
-                          to the literal scene, just not the best match)
-      4. Random      — images with low lit_score relative to the group
-                       (semantically unrelated to both prompts)
+    Scoring signals used:
+      - flgs       : figurative relevance score (higher = more figurative)
+      - fig_score  : CLIP sim to figurative prompt
+      - lit_score  : CLIP sim to literal prompt
+      - gap        : fig_score − lit_score  (positive = figurative)
 
-    Key fix: previously "Partial Literal" was assigned by smallest |gap|,
-    which caused a bird/nest image (low lit_score) to be called "Partial
-    Literal" while all-white-sheep (high lit_score) was called "Random".
-    Now we use absolute lit_score magnitude to distinguish genuine partial
-    matches from unrelated distractors.
+    Assignment rules (in order, each image assigned exactly once):
+
+    IDIOMATIC sentence:
+      1. Figurative    — highest flgs among images with gap > 0
+                         (falls back to highest flgs if none have gap > 0)
+      2. Literal       — highest lit_score among images with gap < 0
+                         (falls back to highest lit_score overall if needed)
+      3. Partial Lit 1 — highest lit_score among remaining
+      4. Partial Lit 2 — second-highest lit_score among remaining
+      5. Random        — whatever is left (lowest relevance to both prompts)
+
+    LITERAL sentence:
+      Same slots but Literal is assigned first (rank 1), Figurative last.
     """
+    assert len(results) == 5, "auto_categorise expects exactly 5 images"
+
     n = len(results)
     by_flgs = sorted(range(n), key=lambda i: results[i]["flgs"], reverse=True)
     by_lit  = sorted(range(n), key=lambda i: results[i]["lit_score"], reverse=True)
+    by_fig  = sorted(range(n), key=lambda i: results[i]["fig_score"], reverse=True)
 
-    assigned = {}
+    assigned   = {}
     used_slots = set()
 
     def assign(idx, cat):
         assigned[idx] = cat
         used_slots.add(idx)
 
-    # 1. Figurative = highest FLGS with positive gap
-    pos_gap = [i for i in by_flgs if results[i]["gap"] > 0]
-    fig_candidates = pos_gap if pos_gap else by_flgs
-    for i in fig_candidates:
-        if i not in used_slots:
-            assign(i, "Figurative")
-            break
+    def first_unused(ordered_list):
+        for i in ordered_list:
+            if i not in used_slots:
+                return i
+        return None
 
-    # 2. Literal = highest lit_score with negative gap (lit_score > fig_score)
-    neg_gap = [i for i in by_lit if results[i]["gap"] < 0]
-    lit_candidates = neg_gap if neg_gap else by_lit
-    for i in lit_candidates:
-        if i not in used_slots:
-            assign(i, "Literal")
-            break
+    # abs(gap) order — images with a large absolute gap are clearly aligned with
+    # either the figurative or literal interpretation (partial literal).
+    # Images with near-zero gap are floating (unrelated = random).
+    by_abs_gap = sorted(range(n), key=lambda i: abs(results[i]["gap"]), reverse=True)
 
-    # 3 & 4. Partial Literal vs Random — use lit_score as the discriminator.
-    # Images whose lit_score is above the global mean are genuinely related to
-    # the literal scene (even if imperfect). Below-mean images are distractors.
-    mean_lit = sum(r["lit_score"] for r in results) / max(n, 1)
+    if sentence_type == "LITERAL":
+        # For literal sentences: Literal → Partial Lit × 2 → Figurative → Random
 
-    remaining = [i for i in range(n) if i not in used_slots]
-    # Sort remaining by lit_score descending so we assign Partial Literal
-    # to the highest-lit-score ones first
-    remaining_by_lit = sorted(remaining, key=lambda i: results[i]["lit_score"], reverse=True)
+        # 1. Literal = highest lit_score with negative gap
+        neg_gap = [i for i in by_lit if results[i]["gap"] < 0]
+        assign(first_unused(neg_gap) or first_unused(by_lit), "Literal")
 
-    for i in remaining_by_lit:
-        if results[i]["lit_score"] >= mean_lit:
-            assign(i, "Partial Literal")
-        else:
-            assign(i, "Random")
+        # 2 & 3. Partial Literal = next two highest abs(gap) among remaining
+        for _ in range(2):
+            idx = first_unused(by_abs_gap)
+            if idx is not None:
+                assign(idx, "Partial Literal")
 
-    # Ensure no image is left unassigned
+        # 4. Figurative = highest flgs remaining
+        idx = first_unused(by_flgs)
+        if idx is not None:
+            assign(idx, "Figurative")
+
+    else:
+        # IDIOMATIC (default)
+
+        # 1. Figurative = highest flgs with positive gap
+        pos_gap = [i for i in by_flgs if results[i]["gap"] > 0]
+        assign(first_unused(pos_gap) or first_unused(by_flgs), "Figurative")
+
+        # 2. Literal = highest lit_score with negative gap
+        neg_gap = [i for i in by_lit if results[i]["gap"] < 0]
+        assign(first_unused(neg_gap) or first_unused(by_lit), "Literal")
+
+        # 3 & 4. Partial Literal = next two largest abs(gap) among remaining.
+        # A partial literal image has a clear directional alignment — it scores
+        # noticeably higher on EITHER the figurative OR the literal prompt.
+        # A truly random image has near-zero gap (CLIP is uncertain which way
+        # it leans), so it naturally falls to the bottom of this ordering.
+        for _ in range(2):
+            idx = first_unused(by_abs_gap)
+            if idx is not None:
+                assign(idx, "Partial Literal")
+
+    # 5. Random = whatever is left (smallest abs(gap) = least directional relevance)
     for i in range(n):
         if i not in used_slots:
             assign(i, "Random")
@@ -1247,6 +1276,39 @@ def auto_categorise(results):
     for i, r in enumerate(results):
         r["category"] = assigned.get(i, "Unknown")
     return results
+
+
+def images_are_unrelated(results, threshold=0.23, sentence_type="IDIOMATIC"):
+    """
+    Return True if NONE of the 5 images meaningfully match the sentence.
+
+    For IDIOMATIC sentences:
+      - Check both fig_score and lit_score against threshold (0.23).
+      - Cartoon/illustrative images can score well on the figurative probe
+        even for wrong idioms, but they still get caught by the literal probe.
+
+    For LITERAL sentences:
+      - Only check lit_score (figurative probe is irrelevant for plain sentences).
+      - Stylised/cartoon images can spuriously score high on the figurative
+        probe even when completely unrelated — so we ignore it entirely.
+      - Use a stricter threshold (0.25) since genuinely matching literal images
+        (e.g. a photo of a couch for "he sat on the couch") score 0.27–0.35,
+        whereas unrelated images cap out around 0.22–0.23.
+
+    Calibration for CLIP ViT-B/32 cosine similarity:
+      - Unrelated / wrong-idiom images : best score typically 0.19 – 0.23
+      - Correct images                 : best score typically 0.25 – 0.38
+    """
+    max_fig = max(r["fig_score"] for r in results)
+    max_lit = max(r["lit_score"] for r in results)
+
+    if sentence_type == "LITERAL":
+        # For literal sentences only the literal probe matters;
+        # a stricter bar (0.25) avoids cartoon false-passes on fig_score.
+        return max_lit < 0.25
+
+    # IDIOMATIC: both probes must exceed 0.23 to be considered related.
+    return max_fig < threshold and max_lit < threshold
 
 
 CATEGORY_COLORS = {
@@ -1258,18 +1320,21 @@ CATEGORY_COLORS = {
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ANALYSIS PIPELINE
+# ANALYSIS PIPELINE — Step 1: sentence only (no images)
 # ──────────────────────────────────────────────────────────────────────────────
-def run_analysis(sentence, images, openai_key=None):
-    """Main analysis pipeline. Takes sentence + list of 5 PIL images."""
-
-    # ── Step 1: Idiom lookup in IDIOM_DB ─────────────────────────────────────
+def analyse_sentence_only(sentence, openai_key=None):
+    """
+    Step 1 of the two-step pipeline.
+    Detects idiom, classifies sentence type (IDIOMATIC / LITERAL), and builds
+    IAPD prompts. No image processing involved — fast.
+    """
+    # Idiom lookup in dictionary
     idiom, idiom_meaning, idiom_origin, vis_fig, vis_lit = lookup_idiom(sentence)
-    idiom_source = "IDIOM_DB" if idiom else None
+    idiom_source           = "IDIOM_DB" if idiom else None
     unknown_idiom_phrase   = None
     unknown_idiom_api_src  = None
 
-    # ── Step 2: CLIP figurative vs literal probe scoring ─────────────────────
+    # CLIP figurative vs literal probe scoring
     fig_probes = [
         "This sentence uses figurative, idiomatic or metaphorical language.",
         "This is an idiomatic expression with a non-literal meaning.",
@@ -1284,17 +1349,16 @@ def run_analysis(sentence, images, openai_key=None):
     fs = float(sum((s_emb * encode_text(p)).sum().item() for p in fig_probes) / len(fig_probes))
     ls = float(sum((s_emb * encode_text(p)).sum().item() for p in lit_probes) / len(lit_probes))
     is_fig = fs > ls
-    diff   = fs - ls
-    conf   = float(min(abs(diff) * 20, 1.0))
+    conf   = float(min(abs(fs - ls) * 20, 1.0))
 
-    # ── Step 3: Sentence type classification ─────────────────────────────────
+    # Classify sentence type
     sentence_type, type_conf, type_reason = classify_sentence_type(
         sentence, idiom, is_fig, conf
     )
 
-    # ── Step 4: If no idiom in DB but sentence looks idiomatic → try API ─────
+    # API fallback for unknown idioms
     if not idiom and sentence_type == "IDIOMATIC":
-        unk_phrase, unk_meaning, unk_src, unk_conf = detect_idiom_with_api(
+        unk_phrase, unk_meaning, unk_src, _ = detect_idiom_with_api(
             sentence, openai_key=openai_key
         )
         if unk_phrase and unk_meaning:
@@ -1304,16 +1368,62 @@ def run_analysis(sentence, images, openai_key=None):
             idiom                 = unk_phrase
             idiom_source          = unk_src
             unknown_idiom_api_src = unk_src
-            # Generate synthetic vis prompts since we have no DB entry
             vis_fig = f"an image representing the figurative or abstract meaning of '{unk_phrase}'"
             vis_lit = f"a literal physical depiction of the words '{unk_phrase}'"
         elif unk_phrase:
-            # Phrase detected but API returned no meaning
-            unknown_idiom_phrase  = unk_phrase
-            idiom_source          = "detected (no meaning found)"
+            unknown_idiom_phrase = unk_phrase
+            idiom_source         = "detected (no meaning found)"
 
     # IAPD perspectives
     perspectives = iapd_prompts(sentence, idiom, vis_fig, vis_lit, idiom_meaning)
+
+    return {
+        "is_figurative":        is_fig,
+        "confidence":           conf,
+        "sentence_type":        sentence_type,
+        "type_confidence":      type_conf,
+        "type_reason":          type_reason,
+        "idiom":                idiom,
+        "idiom_meaning":        idiom_meaning,
+        "idiom_origin":         idiom_origin,
+        "idiom_source":         idiom_source,
+        "unknown_idiom_phrase": unknown_idiom_phrase,
+        "unknown_idiom_api_src":unknown_idiom_api_src,
+        "perspectives":         perspectives,
+        # keep vis prompts so run_analysis can reuse them
+        "_vis_fig":             vis_fig,
+        "_vis_lit":             vis_lit,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ANALYSIS PIPELINE — Step 2: image scoring (uses pre-computed sentence data)
+# ──────────────────────────────────────────────────────────────────────────────
+def run_analysis(sentence, images, openai_key=None, sentence_data=None):
+    """
+    Step 2 of the two-step pipeline.
+    Accepts pre-computed sentence_data from analyse_sentence_only() so the
+    sentence is never re-analysed when re-uploading images.
+    """
+    if sentence_data is None:
+        sentence_data = analyse_sentence_only(sentence, openai_key)
+
+    # Unpack sentence-level data
+    idiom                 = sentence_data["idiom"]
+    idiom_meaning         = sentence_data["idiom_meaning"]
+    idiom_origin          = sentence_data["idiom_origin"]
+    idiom_source          = sentence_data["idiom_source"]
+    unknown_idiom_phrase  = sentence_data["unknown_idiom_phrase"]
+    unknown_idiom_api_src = sentence_data["unknown_idiom_api_src"]
+    is_fig                = sentence_data["is_figurative"]
+    conf                  = sentence_data["confidence"]
+    sentence_type         = sentence_data["sentence_type"]
+    type_conf             = sentence_data["type_confidence"]
+    type_reason           = sentence_data["type_reason"]
+    perspectives          = sentence_data["perspectives"]
+    vis_fig               = sentence_data["_vis_fig"]
+
+    # IAPD embeddings
     lit_emb = encode_text(perspectives[0])
     fig_emb = encode_text(perspectives[1])
     ctx_emb = encode_text(perspectives[2])
@@ -1380,12 +1490,21 @@ def run_analysis(sentence, images, openai_key=None):
         except Exception:
             pass
 
-    # Auto-categorise
-    results = auto_categorise(results)
+    # Auto-categorise (strict 1-1-2-1 rule, sentence-type aware)
+    results = auto_categorise(results, sentence_type=sentence_type)
 
-    # Rank
-    results.sort(key=lambda x: x["flgs"], reverse=True)
-    raw = torch.tensor([r["flgs"] for r in results])
+    # Check if images are completely unrelated to the sentence
+    unrelated = images_are_unrelated(results, threshold=0.23, sentence_type=sentence_type)
+
+    # ── Rank ────────────────────────────────────────────────────────────────
+    if sentence_type == "LITERAL":
+        # Literal sentence → rank by lit_score descending (most literal first)
+        results.sort(key=lambda x: x["lit_score"], reverse=True)
+    else:
+        # Idiomatic sentence → rank by flgs descending (most figurative first)
+        results.sort(key=lambda x: x["flgs"], reverse=True)
+
+    raw   = torch.tensor([r["flgs"] for r in results])
     probs = F.softmax(raw * 10, dim=0).tolist()
     for rank, (r, p) in enumerate(zip(results, probs)):
         r["rank"] = rank + 1
@@ -1424,6 +1543,7 @@ def run_analysis(sentence, images, openai_key=None):
         "results":              results,
         "reasoning":            reasoning,
         "scoring_method":       scoring_method,
+        "unrelated":            unrelated,           # True if images don't match idiom
     }
 
 
@@ -1464,271 +1584,256 @@ with st.sidebar:
 
 st.divider()
 
-# ── Input ──────────────────────────────────────────────────────────────────
-st.subheader("Input")
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — SENTENCE INPUT & ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+st.subheader("Enter Your Sentence")
 
 sentence = st.text_input(
     "Enter a sentence (idiomatic or literal):",
-    value="Comparing the two job offers is like comparing apples and oranges; they have different salary structures and benefits.",
+    value="",
+    placeholder="e.g. He finally kicked the bucket yesterday.",
+    key="sentence_input",
 )
 
-uploaded_files = st.file_uploader(
-    "Select all 5 images at once (hold Ctrl/Cmd to select multiple):",
-    type=["jpg", "jpeg", "png", "webp"],
-    accept_multiple_files=True,
-)
+# Reset session state when sentence changes
+if "last_sentence" not in st.session_state:
+    st.session_state.last_sentence   = ""
+    st.session_state.sentence_data   = None
+    st.session_state.full_data       = None
+    st.session_state.pil_images      = []
 
-pil_images = []
-if uploaded_files:
-    if len(uploaded_files) != 5:
-        st.warning(f"Please select exactly 5 images. You selected {len(uploaded_files)}.")
-    else:
-        pil_images = [Image.open(f).convert("RGB") for f in uploaded_files]
-        cols = st.columns(5)
-        for i, (col, img, f) in enumerate(zip(cols, pil_images, uploaded_files)):
-            col.image(img, caption=f.name, use_container_width=True)
+if sentence.strip() != st.session_state.last_sentence:
+    st.session_state.sentence_data = None
+    st.session_state.full_data     = None
+    st.session_state.pil_images    = []
 
-st.divider()
-
-# ── Analyse button ──────────────────────────────────────────────────────────
-ready = len(pil_images) == 5 and sentence.strip()
-if not ready and uploaded_files:
-    pass  # warning already shown above
-
-if st.button("Analyse", type="primary", disabled=not ready):
-    with st.spinner("Running analysis — CLIP encoding, IAPD prompts, scoring, object detection..."):
-        data = run_analysis(
+if st.button("Analyse Sentence", type="primary", disabled=not sentence.strip()):
+    with st.spinner("Analysing sentence..."):
+        st.session_state.sentence_data  = analyse_sentence_only(
             sentence.strip(),
-            pil_images,
             openai_key=openai_api_key.strip() or None,
         )
+        st.session_state.last_sentence  = sentence.strip()
+        st.session_state.full_data      = None   # reset any previous image result
+        st.session_state.pil_images     = []
+
+# ── Show sentence analysis results ──────────────────────────────────────────
+if st.session_state.sentence_data:
+    sdata  = st.session_state.sentence_data
+    stype  = sdata.get("sentence_type", "LITERAL")
+    tconf  = sdata.get("type_confidence", 0.0)
+    treason = sdata.get("type_reason", "")
 
     st.divider()
-
-    # ══════════════════════════════════════════════════════════════════════
-    # SECTION 1: SENTENCE ANALYSIS
-    # ══════════════════════════════════════════════════════════════════════
     st.subheader("1. Sentence Analysis")
 
-    # ── Big LITERAL / IDIOMATIC badge ────────────────────────────────────
-    stype      = data.get("sentence_type", "LITERAL")
-    tconf      = data.get("type_confidence", 0.0)
-    treason    = data.get("type_reason", "")
-
     if stype == "IDIOMATIC":
-        st.success(
-            f" **IDIOMATIC** sentence detected  —  "
-            f"Confidence: {tconf*100:.0f}%"
-        )
+        st.success(f"**IDIOMATIC** sentence detected  —  Confidence: {tconf*100:.0f}%")
     else:
-        st.info(
-            f" **LITERAL** sentence  —  "
-            f"Confidence: {tconf*100:.0f}%"
-        )
+        st.info(f"**LITERAL** sentence  —  Confidence: {tconf*100:.0f}%")
 
     st.caption(f"*Classification reason: {treason}*")
+    st.write("")
 
-    st.write("")  # spacer
-
-    # ── Idiom details ─────────────────────────────────────────────────────
-    if data["idiom"]:
-        src = data.get("idiom_source", "")
+    if sdata["idiom"]:
+        src = sdata.get("idiom_source", "")
         src_badge = {
-            "IDIOM_DB":           " Built-in dictionary",
-            "Free Dictionary API":" Free Dictionary API",
-            "OpenAI GPT-3.5":     " OpenAI GPT-3.5",
-        }.get(src, f" {src}" if src else "")
+            "IDIOM_DB":           "Built-in dictionary",
+            "Free Dictionary API":"Free Dictionary API",
+            "OpenAI GPT-3.5":     "OpenAI GPT-3.5",
+        }.get(src, src or "")
 
-        st.write(f"**Idiom detected:** \"{data['idiom']}\"")
-
+        st.write(f"**Idiom detected:** \"{sdata['idiom']}\"")
         c1, c2 = st.columns([3, 1])
-        c1.write(f"**Meaning:** {data['idiom_meaning']}")
+        c1.write(f"**Meaning:** {sdata['idiom_meaning']}")
         if src_badge:
             c2.write(f"**Source:** {src_badge}")
+        if sdata.get("idiom_origin"):
+            st.write(f"**Origin / Notes:** {sdata['idiom_origin']}")
 
-        if data.get("idiom_origin"):
-            st.write(f"**Origin / Notes:** {data['idiom_origin']}")
-
-        # Highlight the idiom phrase inside the sentence
-        _highlighted = sentence.replace(
-            data["idiom"],
-            f"**{data['idiom']}**",
+        _highlighted = sentence.strip().replace(
+            sdata["idiom"], f"**{sdata['idiom']}**"
         )
         st.markdown(f"**Sentence:** {_highlighted}")
 
     elif stype == "IDIOMATIC":
-        # Sentence flagged as idiomatic but no specific phrase found
-        unk = data.get("unknown_idiom_phrase")
+        unk = sdata.get("unknown_idiom_phrase")
         if unk:
             st.warning(
-                f" Possible idiom detected: **\"{unk}\"** — "
-                f"but meaning could not be retrieved from the API. "
-                f"Try adding an OpenAI API key in the sidebar for best results."
+                f"Possible idiom detected: **\"{unk}\"** — "
+                "meaning could not be retrieved. Add an OpenAI API key in the sidebar."
             )
         else:
-            st.warning(
-                " Sentence appears figurative/idiomatic but no specific idiom phrase "
-                "was identified."
-            )
+            st.warning("Sentence appears figurative/idiomatic but no specific idiom phrase was identified.")
     else:
-        st.write(" No idiom detected. This sentence is treated as a plain literal statement.")
+        st.write("No idiom detected. This sentence is treated as a plain literal statement.")
 
     st.write("")
-
     st.write("**IAPD Prompts used for scoring:**")
     pcols = st.columns(2)
-    pcols[0].info(f"**Literal prompt:**\n\n{data['perspectives'][0]}")
-    pcols[1].success(f"**Figurative prompt:**\n\n{data['perspectives'][1]}")
+    pcols[0].info(f"**Literal prompt:**\n\n{sdata['perspectives'][0]}")
+    pcols[1].success(f"**Figurative prompt:**\n\n{sdata['perspectives'][1]}")
 
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 2 — IMAGE UPLOAD & ANALYSIS
+    # ══════════════════════════════════════════════════════════════════════
     st.divider()
+    st.subheader("Upload Images")
+    st.caption("Upload exactly 5 images to rank against the sentence above.")
 
-    # ══════════════════════════════════════════════════════════════════════
-    # SECTION 2: IMAGE RANKING
-    # ══════════════════════════════════════════════════════════════════════
-    st.subheader("2. Image Ranking & Categorisation")
-    st.write("Images ranked by figurative relevance. Objects detected using improved CLIP zero-shot (threshold ≥ 0.24).")
+    uploaded_files = st.file_uploader(
+        "Select any 5 images:",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        key="image_uploader",
+    )
 
-    sorted_results = sorted(data["results"], key=lambda r: r["rank"])
-    rcols = st.columns(5)
-
-    CATEGORY_COLORS = {
-        "Figurative":      "🟢",
-        "Literal":         "🟠",
-        "Partial Literal": "🔵",
-        "Random":          "🟤",
-    }
-
-    for r, col in zip(sorted_results, rcols):
-        img = pil_images[r["index"]]
-        icon = CATEGORY_COLORS.get(r["category"], "⚪")
-        best = " ✓ Best" if r["rank"] == 1 else ""
-        col.image(img, use_container_width=True)
-        col.write(f"**#{r['rank']}{best}**")
-        col.write(f"{icon} **{r['category']}**")
-        col.write(f"Match: {r['confidence_pct']}%")
-        col.write(f"Fig: {r['fig_score']:.3f} | Lit: {r['lit_score']:.3f}")
-        gap_str = f"+{r['gap']:.3f}" if r['gap'] >= 0 else f"{r['gap']:.3f}"
-        col.write(f"Gap: {gap_str}")
-        if r["objects"]:
-            col.write("**Objects:** " + ", ".join(o for o, _ in r["objects"]))
-        elif r.get("scenes"):
-            # Fix 2: show scene when no objects detected
-            col.write("**Scene:** " + r["scenes"][0][0][:60])
+    pil_images = []
+    if uploaded_files:
+        if len(uploaded_files) != 5:
+            st.warning(f"Please select exactly 5 images. You selected {len(uploaded_files)}.")
         else:
-            col.write("*No visual features detected*")
+            pil_images = [Image.open(f).convert("RGB") for f in uploaded_files]
+            cols = st.columns(5)
+            for i, (col, img, f) in enumerate(zip(cols, pil_images, uploaded_files)):
+                col.image(img, caption=f.name, use_container_width=True)
 
-    st.divider()
-
-    # ══════════════════════════════════════════════════════════════════════
-    # SECTION 3: COMMONSENSE REASONING CHAIN
-    # ══════════════════════════════════════════════════════════════════════
-    st.subheader("3. Visual Commonsense Reasoning Chain")
-    st.write("Step-by-step reasoning from detected objects through to figurative meaning.")
-
-    reasoning = data["reasoning"]
-
-    # 1. Visual Evidence
-    st.write("####  Visual Evidence")
-    ve = reasoning["visual_evidence"]
-    if ve["objects"]:
-        st.write("**Objects detected in top-ranked image:**")
-        for obj_name, obj_score in ve["objects"]:
-            st.write(f"- {obj_name} (similarity: {obj_score:.4f})")
-    else:
-        st.write("No high-confidence objects detected above threshold.")
-    if ve["scenes"]:
-        st.write("**Scene descriptions:**")
-        for scene_text, score in ve["scenes"]:
-            st.write(f"- \"{scene_text}\" ({score:.4f})")
-
-    st.write("---")
-
-    # 2. Scene Description
-    #st.write("####  Scene Description")
-    #st.write(reasoning["scene_description"])
-
-    #st.write("---")
-
-    # 3. Object Chain → Commonsense Reasoning
-    st.write("####  Object Chain → Commonsense Reasoning")
-    if reasoning["object_chain"]:
-        for step in reasoning["object_chain"]:
-            # strip markdown bold for plain display
-            clean = step.replace("**", "")
-            st.write(clean)
-    else:
-        st.write("No object chain could be built (no objects detected).")
-
-    st.write("---")
-
-    # 3.5  ConceptNet Knowledge Graph
-    st.write("####  ConceptNet Knowledge Graph")
-    st.write("Semantic relations from idiom words to abstract concepts")
-
-    _cn_idiom = data.get("idiom") or ""
-    _cn_meaning = data.get("idiom_meaning") or ""
-
-    if _cn_idiom and CN is not None:
-        _chains = build_cn_relation_chains(_cn_idiom, top_n=5)
-
-        if _chains:
-            # Per-word relation chains
-            for _word, _relations in _chains.items():
-                # Group concepts by relation type for a cleaner display
-                _by_rel = {}
-                for _concept, _rel in _relations:
-                    _by_rel.setdefault(_rel, []).append(_concept)
-
-                # Build the arrow chain string: word → RelType → c1 · c2 · c3
-                _chain_parts = []
-                for _rel, _concepts in _by_rel.items():
-                    _chain_parts.append(f"**{_rel}** → {' · '.join(_concepts)}")
-
-                _chain_str = f"**{_word}** → " + "  |  ".join(_chain_parts)
-                st.markdown(_chain_str)
-        else:
-            st.write(
-                f"No NumberBatch entries found for the content words of \"{_cn_idiom}\". "
-                "The word may not be in the ConceptNet vocabulary."
+    if st.button(
+        "Analyse Images",
+        type="primary",
+        disabled=(len(pil_images) != 5),
+        key="analyse_images_btn",
+    ):
+        with st.spinner("Analysing the Images..."):
+            st.session_state.full_data   = run_analysis(
+                sentence.strip(),
+                pil_images,
+                openai_key=openai_api_key.strip() or None,
+                sentence_data=st.session_state.sentence_data,
             )
-    elif CN is None:
-        st.write("ConceptNet NumberBatch not loaded — place `conceptnet/numberbatch_en.pkl` in the project folder.")
-    else:
-        st.write("No idiom detected — ConceptNet graph not available for general sentences.")
+            st.session_state.pil_images  = pil_images
 
-    st.write("---")
+    # ── Show image results ───────────────────────────────────────────────
+    if st.session_state.full_data and st.session_state.pil_images:
+        data       = st.session_state.full_data
+        pil_images = st.session_state.pil_images
 
-    # 4. Idiom Match
-    st.write("####  Idiom Match")
-    im = reasoning["idiom_match"]
-    if im["idiom"]:
-        st.write(f"**Matched idiom:** \"{im['idiom']}\"")
-        st.write(f"**Meaning:** {im['meaning']}")
-        st.write(f"**Origin:** {im['origin']}")
-        st.write(f"**Figurative probe used:** \"{im['figurative_probe']}\"")
-        if im["known"]:
-            st.write("*Note: De-idiomised contextual prompt was used — idiom phrase replaced with its meaning to prevent CLIP anchoring to literal words.*")
-    else:
-        st.write("No idiom matched in dictionary — analysed as general figurative expression.")
+        st.divider()
 
-    st.write("---")
+        # ══════════════════════════════════════════════════════════════════
+        # SECTION 2: IMAGE RANKING
+        # ══════════════════════════════════════════════════════════════════
+        st.subheader("2. Image Ranking & Categorisation")
 
-    # 5. Score Breakdown
-    st.write("####  Score Breakdown (Top-Ranked Image)")
-    sb = reasoning["score_breakdown"]
-    st.write(f"**Category:** {sb['category']}")
-    sc1, sc2, sc3, sc4 = st.columns(4)
-    sc1.metric("Figurative score", f"{sb['fig_score']:.4f}")
-    sc2.metric("Literal score", f"{sb['lit_score']:.4f}")
-    sc3.metric("Contextual score", f"{sb['ctx_score']:.4f}")
-    sc4.metric("Gap (fig − lit)", f"{sb['gap']:+.4f}")
-    st.write(f"**FLGS score:** {sb['flgs']:.4f}")
-    st.write(f"**Scoring engine:** {sb['scoring_method']}")
-    st.write(f"**Gap interpretation:** {sb['gap_interpretation']}")
+        if data.get("unrelated"):
+            st.error("Images do not match the sentence provided.")
+        else:
+            _stype = data.get("sentence_type", "IDIOMATIC")
+            _rank_note = (
+                "Ranked by **literal relevance** (most literal image ranked #1)."
+                if _stype == "LITERAL"
+                else "Ranked by **figurative relevance** (most figurative image ranked #1)."
+            )
+            st.caption(_rank_note)
 
-    st.write("---")
+            sorted_results = sorted(data["results"], key=lambda r: r["rank"])
+            rcols = st.columns(5)
+            CATEGORY_ICONS = {
+                "Figurative":      "🟢",
+                "Literal":         "🟠",
+                "Partial Literal": "🔵",
+                "Random":          "🟤",
+            }
+            for r, col in zip(sorted_results, rcols):
+                img  = pil_images[r["index"]]
+                icon = CATEGORY_ICONS.get(r["category"], "⚪")
+                best = " ✓ Best" if r["rank"] == 1 else ""
+                col.image(img, use_container_width=True)
+                col.write(f"**#{r['rank']}{best}**")
+                col.write(f"{icon} **{r['category']}**")
+                col.write(f"Match: {r['confidence_pct']}%")
+                col.write(f"Fig: {r['fig_score']:.3f} | Lit: {r['lit_score']:.3f}")
+                gap_str = f"+{r['gap']:.3f}" if r['gap'] >= 0 else f"{r['gap']:.3f}"
+                col.write(f"Gap: {gap_str}")
+                if r["objects"]:
+                    col.write("**Objects:** " + ", ".join(o for o, _ in r["objects"]))
+                elif r.get("scenes"):
+                    col.write("**Scene:** " + r["scenes"][0][0][:60])
+                else:
+                    col.write("*No visual features detected*")
 
-    # 6. Final Conclusion
-    st.write("####  Final Figurative Meaning")
-    clean_conclusion = reasoning["conclusion"].replace("**", "")
-    st.write(clean_conclusion)
+            st.divider()
+
+            # ══════════════════════════════════════════════════════════════
+            # SECTION 3: COMMONSENSE REASONING CHAIN
+            # ══════════════════════════════════════════════════════════════
+            st.subheader("3. Visual Commonsense Reasoning Chain")
+            #st.write("Step-by-step reasoning from detected objects through to figurative meaning.")
+
+            reasoning = data["reasoning"]
+
+            st.write("#### Visual Evidence")
+            ve = reasoning["visual_evidence"]
+            if ve["objects"]:
+                st.write("**Objects detected in top-ranked image:**")
+                for obj_name, obj_score in ve["objects"]:
+                    st.write(f"- {obj_name} (similarity: {obj_score:.4f})")
+            else:
+                st.write("No high-confidence objects detected above threshold.")
+            if ve["scenes"]:
+                st.write("**Scene descriptions:**")
+                for scene_text, score in ve["scenes"]:
+                    st.write(f"- \"{scene_text}\" ({score:.4f})")
+
+            st.write("---")
+
+            st.write("#### Object Chain → Commonsense Reasoning")
+            if reasoning["object_chain"]:
+                for step in reasoning["object_chain"]:
+                    st.write(step.replace("**", ""))
+            else:
+                st.write("No object chain could be built (no objects detected).")
+
+            st.write("---")
+
+            st.write("#### ConceptNet Knowledge Graph")
+            st.write("Semantic relations from idiom words to abstract concepts")
+            _cn_idiom = data.get("idiom") or ""
+            if _cn_idiom and CN is not None:
+                _chains = build_cn_relation_chains(_cn_idiom, top_n=5)
+                if _chains:
+                    for _word, _relations in _chains.items():
+                        _by_rel = {}
+                        for _concept, _rel in _relations:
+                            _by_rel.setdefault(_rel, []).append(_concept)
+                        _chain_parts = [
+                            f"**{_rel}** → {' · '.join(_concepts)}"
+                            for _rel, _concepts in _by_rel.items()
+                        ]
+                        st.markdown(f"**{_word}** → " + "  |  ".join(_chain_parts))
+                else:
+                    st.write(f"No NumberBatch entries found for \"{_cn_idiom}\".")
+            elif CN is None:
+                st.write("ConceptNet not loaded.")
+            else:
+                st.write("No idiom detected.")
+
+            st.write("---")
+
+            st.write("#### Score Breakdown (Top-Ranked Image)")
+            sb = reasoning["score_breakdown"]
+            st.write(f"**Category:** {sb['category']}")
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("Figurative score",  f"{sb['fig_score']:.4f}")
+            sc2.metric("Literal score",     f"{sb['lit_score']:.4f}")
+            sc3.metric("Contextual score",  f"{sb['ctx_score']:.4f}")
+            sc4.metric("Gap (fig − lit)",   f"{sb['gap']:+.4f}")
+            st.write(f"**FLGS score:** {sb['flgs']:.4f}")
+            st.write(f"**Scoring engine:** {sb['scoring_method']}")
+            st.write(f"**Gap interpretation:** {sb['gap_interpretation']}")
+
+            st.write("---")
+
+            st.write("#### Final Figurative Meaning")
+            st.write(reasoning["conclusion"].replace("**", ""))
