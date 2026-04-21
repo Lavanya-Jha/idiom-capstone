@@ -17,6 +17,7 @@ HOW TO RUN:
 
 import os, io, pickle, re
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import requests
@@ -1318,6 +1319,22 @@ CATEGORY_COLORS = {
     "Random":          "#6d4c41",
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# BENCHMARK TEST SET  (used by Option C — Model Accuracy Comparison)
+# ──────────────────────────────────────────────────────────────────────────────
+BENCHMARK_SENTENCES = [
+    ("He finally kicked the bucket yesterday.", "IDIOMATIC"),
+    ("She's been burning the midnight oil all week.", "IDIOMATIC"),
+    ("It's raining cats and dogs outside.", "IDIOMATIC"),
+    ("He let the cat out of the bag.", "IDIOMATIC"),
+    ("She has been sitting on the fence about this decision.", "IDIOMATIC"),
+    ("He closed the door and sat down quietly.", "LITERAL"),
+    ("The cat is sleeping on the sofa.", "LITERAL"),
+    ("She ate an apple for breakfast.", "LITERAL"),
+    ("He is not that important in this project.", "LITERAL"),
+    ("The rain fell heavily on the roof all night.", "LITERAL"),
+]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ANALYSIS PIPELINE — Step 1: sentence only (no images)
@@ -1550,6 +1567,144 @@ def run_analysis(sentence, images, openai_key=None, sentence_data=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# MODEL COMPARISON HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def classify_with_gemini(sentence, api_key, model="gemini-2.0-flash"):
+    """Zero-shot LITERAL/IDIOMATIC classification via Gemini REST API."""
+    try:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={api_key}"
+        )
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": (
+                                "You are a linguistics expert. Classify the following sentence as "
+                                "LITERAL or IDIOMATIC. Reply with exactly one word: LITERAL or IDIOMATIC.\n\n"
+                                f'Sentence: "{sentence}"'
+                            )
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {"maxOutputTokens": 10, "temperature": 0},
+        }
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code == 200:
+            raw = (
+                r.json()
+                .get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+                .strip()
+                .upper()
+            )
+            label = "IDIOMATIC" if "IDIOMATIC" in raw else "LITERAL"
+            return label, None
+        else:
+            return "ERROR", f"HTTP {r.status_code}: {r.text[:120]}"
+    except Exception as e:
+        return "ERROR", str(e)
+
+
+def classify_keyword_baseline(sentence):
+    """Simple baseline: exact substring match against IDIOM_DB keys."""
+    s = sentence.lower()
+    for idiom in IDIOM_DB:
+        if idiom in s:
+            return "IDIOMATIC"
+    return "LITERAL"
+
+
+def random_baseline(sentence):
+    """Deterministic pseudo-random based on sentence hash so results are consistent."""
+    import hashlib
+    h = int(hashlib.md5(sentence.encode()).hexdigest(), 16)
+    return "IDIOMATIC" if h % 2 == 0 else "LITERAL"
+
+
+def always_literal_baseline(sentence):
+    return "LITERAL"
+
+
+def always_idiomatic_baseline(sentence):
+    return "IDIOMATIC"
+
+
+def classify_with_cohere(sentence, api_key):
+    """Zero-shot classification via Cohere API."""
+    try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "command-r",
+            "max_tokens": 10,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f'Classify as LITERAL or IDIOMATIC (reply with one word only): "{sentence}"',
+                }
+            ],
+        }
+        r = requests.post(
+            "https://api.cohere.com/v2/chat",
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        if r.status_code == 200:
+            raw = r.json()["message"]["content"][0]["text"].strip().upper()
+            label = "IDIOMATIC" if "IDIOMATIC" in raw else "LITERAL"
+            return label, None
+        else:
+            return "ERROR", f"HTTP {r.status_code}: {r.text[:120]}"
+    except Exception as e:
+        return "ERROR", str(e)
+
+
+def classify_with_hf(sentence, api_key, model="facebook/bart-large-mnli"):
+    """Zero-shot classification via HuggingFace Inference API."""
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        payload = {
+            "inputs": sentence,
+            "parameters": {
+                "candidate_labels": [
+                    "idiomatic figurative expression",
+                    "literal factual statement",
+                ]
+            },
+        }
+        r = requests.post(
+            f"https://api-inference.huggingface.co/models/{model}",
+            json=payload,
+            headers=headers,
+            timeout=30,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            labels = data.get("labels", [])
+            scores = data.get("scores", [])
+            if labels and scores:
+                best = labels[scores.index(max(scores))]
+                label = "IDIOMATIC" if "idiomatic" in best.lower() else "LITERAL"
+            else:
+                label = "LITERAL"
+            return label, None
+        else:
+            return "ERROR", f"HTTP {r.status_code}: {r.text[:120]}"
+    except Exception as e:
+        return "ERROR", str(e)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI — plain, no custom CSS
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1570,6 +1725,27 @@ with st.sidebar:
         type="password",
         placeholder="sk-...",
         help="If provided, GPT-3.5-turbo is queried when an idiom is not found in the built-in dictionary.",
+    )
+
+    gemini_api_key = st.text_input(
+        "Gemini API key",
+        type="password",
+        placeholder="AIza...",
+        help="Used for model comparison. Get a free key at Google AI Studio.",
+    )
+
+    cohere_api_key = st.text_input(
+        "Cohere API key",
+        type="password",
+        placeholder="...",
+        help="Free tier available at cohere.com",
+    )
+
+    hf_api_key = st.text_input(
+        "HuggingFace API key",
+        type="password",
+        placeholder="hf_...",
+        help="Free at huggingface.co — for BART and RoBERTa comparison.",
     )
 
     st.divider()
@@ -1837,3 +2013,120 @@ if st.session_state.sentence_data:
 
             st.write("#### Final Figurative Meaning")
             st.write(reasoning["conclusion"].replace("**", ""))
+
+    # ── Option C: Benchmark Accuracy Comparison ──────────────────────────
+    st.divider()
+    st.subheader("4. Benchmark — Model Accuracy Comparison")
+    st.caption(
+        "Evaluate all available models on a fixed set of 10 sentences "
+        "(5 idiomatic, 5 literal) and compare their accuracy."
+    )
+
+    if st.button("Run Benchmark", key="run_benchmark"):
+        benchmark_results = {}
+
+        # Helper to evaluate a model on all benchmark sentences
+        def _eval_model(label, classify_fn):
+            correct = 0
+            details = []
+            for sent, gold in BENCHMARK_SENTENCES:
+                pred = classify_fn(sent)
+                ok = pred == gold
+                if ok:
+                    correct += 1
+                details.append({"Sentence": sent[:60], "Gold": gold, "Predicted": pred, "Correct": ok})
+            acc = correct / len(BENCHMARK_SENTENCES) * 100
+            return acc, details
+
+        progress = st.progress(0, text="Running benchmark...")
+
+        # 1. This model
+        def _our_model(sent):
+            _idiom, _, _, _, _ = lookup_idiom(sent)
+            s_emb = encode_text(sent)
+            _fig_probes = [
+                "This sentence uses figurative, idiomatic or metaphorical language.",
+                "This is an idiomatic expression with a non-literal meaning.",
+                "This sentence contains a figure of speech or idiom.",
+            ]
+            _lit_probes = [
+                "This sentence is literal and straightforward with no idioms.",
+                "This sentence means exactly what it says with no figurative language.",
+                "This is a plain factual statement with no metaphors or idioms.",
+            ]
+            _fs = float(sum((s_emb * encode_text(p)).sum().item() for p in _fig_probes) / len(_fig_probes))
+            _ls = float(sum((s_emb * encode_text(p)).sum().item() for p in _lit_probes) / len(_lit_probes))
+            _is_fig = _fs > _ls
+            _conf = float(min(abs(_fs - _ls) * 20, 1.0))
+            label_out, _, _ = classify_sentence_type(sent, _idiom, _is_fig, _conf)
+            return label_out
+
+        acc_our, details_our = _eval_model("This model", _our_model)
+        benchmark_results["This model"] = acc_our
+        progress.progress(0.08, text="This model done...")
+
+        # 2. Keyword baseline
+        acc_kw, details_kw = _eval_model("Keyword Baseline", classify_keyword_baseline)
+        benchmark_results["Keyword Baseline"] = acc_kw
+        progress.progress(0.16, text="Keyword baseline done...")
+
+        # 3. Gemini 2.0 Flash
+        if gemini_api_key.strip():
+            def _gemini(sent):
+                lbl, _ = classify_with_gemini(sent, gemini_api_key.strip())
+                return lbl if lbl in ("IDIOMATIC", "LITERAL") else "LITERAL"
+            acc_gem, details_gem = _eval_model("Gemini 2.0 Flash", _gemini)
+            benchmark_results["Gemini 2.0 Flash"] = acc_gem
+        progress.progress(0.40, text="Gemini 2.0 Flash done...")
+
+        # 4. Gemini 1.5 Pro
+        if gemini_api_key.strip():
+            def _gemini15(sent):
+                lbl, _ = classify_with_gemini(sent, gemini_api_key.strip(), model="gemini-1.5-pro")
+                return lbl if lbl in ("IDIOMATIC", "LITERAL") else "LITERAL"
+            acc_gem15, details_gem15 = _eval_model("Gemini 1.5 Pro", _gemini15)
+            benchmark_results["Gemini 1.5 Pro"] = acc_gem15
+        progress.progress(0.55, text="Gemini 1.5 Pro done...")
+
+        # 5. Cohere Command-R
+        if cohere_api_key.strip():
+            def _cohere(sent):
+                lbl, _ = classify_with_cohere(sent, cohere_api_key.strip())
+                return lbl if lbl in ("IDIOMATIC", "LITERAL") else "LITERAL"
+            acc_cohere, _ = _eval_model("Cohere Command-R", _cohere)
+            benchmark_results["Cohere Command-R"] = acc_cohere
+        progress.progress(0.70, text="Cohere Command-R done...")
+
+        # 6. HuggingFace BART
+        if hf_api_key.strip():
+            def _hf_bart(sent):
+                lbl, _ = classify_with_hf(sent, hf_api_key.strip(), model="facebook/bart-large-mnli")
+                return lbl if lbl in ("IDIOMATIC", "LITERAL") else "LITERAL"
+            acc_bart, _ = _eval_model("BART-large-MNLI", _hf_bart)
+            benchmark_results["BART-large-MNLI"] = acc_bart
+        progress.progress(0.86, text="BART done...")
+
+        # 7. Random baseline (no key needed)
+        acc_rand, _ = _eval_model("Random Baseline", random_baseline)
+        benchmark_results["Random Baseline"] = acc_rand
+        progress.progress(1.0, text="Done!")
+
+        st.session_state["benchmark_results"] = benchmark_results
+
+    if st.session_state.get("benchmark_results"):
+        bres = st.session_state["benchmark_results"]
+
+        # Summary table + bar chart
+        summary_df = pd.DataFrame(
+            [{"Model": m, "Accuracy (%)": round(a, 1)} for m, a in bres.items()]
+        )
+        st.dataframe(
+            summary_df,
+            column_config={
+                "Model": st.column_config.TextColumn("Model", width="medium"),
+                "Accuracy (%)": st.column_config.NumberColumn("Accuracy (%)", width="small", format="%.1f%%"),
+            },
+            use_container_width=False,
+            hide_index=True,
+        )
+        st.bar_chart(summary_df.set_index("Model"))
